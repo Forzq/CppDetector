@@ -22,13 +22,15 @@ struct InspectResult {
     cv::Mat heatmap;                // CV_8U diff map (working resolution)
     int diffThreshold = 0;          // diff level treated as anomalous (sensitivity mapped)
     double ms = 0.0;
+    cv::Matx23d refToCurrent{1,0,0,0,1,0}; // original px; deferred display maps the diff back to the input
 };
 
 class Inspector {
 public:
     // roi: polygon in original-image coordinates; empty = whole frame
     void setReference(const cv::Mat& bgr, const std::vector<cv::Point>& roi, const InspectParams& p);
-    InspectResult inspect(const cv::Mat& bgr, const InspectParams& p) const;
+    InspectResult inspect(const cv::Mat& bgr, const InspectParams& p,
+                          const cv::Matx23d* refToCurrent = nullptr) const;
     bool hasReference() const { return !refGray_.empty(); }
 
 private:

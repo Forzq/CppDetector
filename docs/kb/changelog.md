@@ -1,5 +1,9 @@
 # Changelog
 
+- 2026-10-22: D20: optional label placement/top-edge inspection relative to independent bucket anchors; bounded rigid texture compensation with geometric rejection preserved. Added geometry settings/canvas editor and reason codes. Moved overlay encoding/reject images and JSONL disk IO behind verdict publication; bounded per-camera image queue, explicit readiness/versioning/error counters, stale-result invalidation. Added geometry, queue, HTTP and headless-browser checks plus frame-to-verdict benchmark. Corrected camera-4 seam endpoints; new geometry remains opt-in pending body-anchor calibration.
+
+- 2026-10-22: locally evaluated frames36 with an isolated C++/Docker study runner (tools/inspection-study). 990 natural-frame comparisons, 16,380 parameter-sweep comparisons, 9,240 seam measurements, 795 timed ten-camera batches. No inspection or production config changes. Report: docs/reports/frames36-2026-10-22.md; findings and environment limitations: D19.
+
 - 2026-10-20: PLAN.md written; skeleton (CMakeLists, vcpkg.json, CMakePresets.json, src/main.cpp); KB created; vcpkg cloned to D:\vcpkg.
 - 2026-10-20: vcpkg deps built (OpenCV 4.14.0, httplib 0.62, nlohmann 3.12). Added src/inspect/inspector.{h,cpp} and a console runner in src/main.cpp (args: root sens thr [defect]).
 - 2026-10-20: web test UI (grid of 10 cameras, per-camera setup with ROI polygon editor, auto-ROI, reference pick/upload, manual/uploaded/all-frames inspection, decision log view), JSON API, JSONL decision log + reject overlays, config persistence, emulated stream. Measured: batch 250-310 ms wall for 10 cameras incl. overlay and logging.

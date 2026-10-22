@@ -18,12 +18,13 @@
     <button id="runBtn" class="primary">▶ Старт потока</button>
     <label>период, мс <input id="period" type="number" min="100" max="60000" step="100" value="1000"></label>
     <label class="check"><input id="globalDefect" type="checkbox"> тестовый дефект</label>
-    <div class="batch" title="Время обработки пачки из 10 кадров (чтение + инспекция + отрисовка), бюджет 500 мс">
+    <div class="batch" title="Время до вердиктов по 10 кадрам: чтение + инспекция + геометрия. Изображения и запись готовятся в фоне. Бюджет 500 мс.">
       <div class="batch-text"><span id="batchNum">пачка —</span> <b id="batchMs">— мс</b> <span class="muted">/ 500</span></div>
       <div class="bar"><div id="batchBar"></div></div>
     </div>
   </div>
 </header>
+<div id="backgroundInfo" class="muted small" role="status"></div>
 
 <main>
   <!-- ===== Camera grid ===== -->
@@ -95,6 +96,18 @@
             <input type="range" id="seam_edge_frac" min="0" max="0.4" step="0.01"></div>
         </div>
 
+        <div class="card">
+          <h2>Положение этикетки и верхний край</h2>
+          <label class="check"><input id="geometryEnabled" type="checkbox"> контролировать положение относительно ведра</label>
+          <p class="muted small">Задай ROI инспекции по этикетке, линию стыка, верхний край этикетки и устойчивый контур корпуса независимо от печати. Опора должна двигаться вместе с ведром. Верх изделия может находиться внизу кадра.</p>
+          <div class="row"><button id="geometryTop">Задать верхний край</button><button id="geometryBody">Задать опору на корпусе</button></div>
+          <div class="row"><button id="geometryFinish">Завершить точки</button><button id="geometryCancel">Отменить</button></div>
+          <div id="geometryInfo" class="muted small"></div>
+          <div class="param"><label>Полоса поиска ±, px <b id="v_geometry_band"></b></label><input id="geometry_band" type="range" min="4" max="40" step="1"></div>
+          <div class="param"><label>Допуск смещения, px <b id="v_geometry_position_tolerance"></b></label><input id="geometry_position_tolerance" type="range" min="0.1" max="30" step="0.1"></div>
+          <div class="param"><label>Допуск наклона, ° <b id="v_geometry_angle_tolerance"></b></label><input id="geometry_angle_tolerance" type="range" min="0.05" max="3" step="0.05"></div>
+          <div class="param"><label>Допуск локального изгиба, px <b id="v_geometry_shape_tolerance"></b></label><input id="geometry_shape_tolerance" type="range" min="0.2" max="10" step="0.1"></div>
+        </div>
         <div class="card">
           <h2>Проверка</h2>
           <div class="row">

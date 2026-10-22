@@ -13,6 +13,7 @@ add_executable(cppdetector
   src/inspect/inspector.cpp
   src/inspect/auto_roi.cpp
   src/inspect/seam.cpp
+  src/inspect/geometry.cpp
   src/app/app.cpp
   src/app/decision_log.cpp
   src/app/bench.cpp

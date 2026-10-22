@@ -9,7 +9,7 @@
 - C7. Ignore result.json and heatmap.u8 in the dataset; use frame.jpg only.
 - C8. Dependencies live in vcpkg (D:\vcpkg, manifest mode, outside the repo). Triplet x64-windows-static-md. Toolchain: MSVC 14.44 (VS Build Tools 2022), CMake 4.x.
 - C9. UI texts are Russian; code, logs, KB are English-keyed (reason codes: score_over_threshold, shift_exceeded, no_reference). Reason codes are consumed by the UI (web/app.js reasonText) - keep them in sync.
-- C10. Batch time shown in the UI is the full wall time of a tick (read + inspect + overlay + log) for all 10 cameras, compared with 500 ms.
+- C10. Starting with D20 (explicit user request, 2026-10-22), batch_ms/batch_decision_ms shown in the UI measure wall time to the ten verdicts: read + geometry + inspection + enqueue. JPEG overlays, reject images and JSONL disk writes run in background workers. Their readiness, latency, coalesced images and write failures are exposed separately. Keep the 500 ms verdict budget; never substitute pure inspection time for frame-to-verdict wall time.
 - C11. Never commit/push in D:\GitHubPj\defect-detector-v3 (the user does it). Do not touch unrelated parts of that repo; keep the Python path working (`python_detector.backend: python` is the default).
 - C12. cppAnalisSurface API compatibility: keep the Python field names in InspectResponse (the Java pipeline reads them), keep ROI normalized 0..1, status strings "ГОДЕН"/"БРАК", `detector_id` in every JSON object, error body `{detail,error_code}` with `no_reference` code (the Java client relies on it for auto-recovery).
 - C13. HTTP thread pool of cppAnalisSurface must stay larger than the number of concurrent client connections (see D14).

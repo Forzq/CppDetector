@@ -3,6 +3,8 @@
 #include <opencv2/imgcodecs.hpp>
 #include <algorithm>
 #include <fstream>
+#include <type_traits>
+#include <utility>
 
 namespace cd {
 
@@ -32,13 +34,18 @@ bool boolParam(const httplib::Request& req, const char* k) {
 }
 
 // Decodes the multipart field "file" into an image.
-bool uploadedImage(const httplib::Request& req, cv::Mat& img, std::string& name) {
-    if (!req.form.has_file("file")) return false;
-    auto f = req.form.get_file("file");
-    name = f.filename;
-    std::vector<uchar> data(f.content.begin(), f.content.end());
-    img = cv::imdecode(data, cv::IMREAD_COLOR);
-    return !img.empty();
+template<class T,class=void>struct HasForm:std::false_type{};
+template<class T>struct HasForm<T,std::void_t<decltype(std::declval<T>().form)>>:std::true_type{};
+template<class Request>
+bool uploadedImage(const Request& req, cv::Mat& img, std::string& name) {
+    auto decode=[&](const auto& f){name=f.filename;std::vector<uchar> data(f.content.begin(),f.content.end());img=cv::imdecode(data,cv::IMREAD_COLOR);return !img.empty();};
+    if constexpr(HasForm<Request>::value) {
+        if(!req.form.has_file("file"))return false;
+        return decode(req.form.get_file("file"));
+    } else {
+        if(!req.has_file("file"))return false;
+        return decode(req.get_file_value("file"));
+    }
 }
 
 } // namespace
@@ -141,7 +148,12 @@ void registerRoutes(httplib::Server& svr, App& app) {
 
     svr.Get("/api/overlay", [&](const httplib::Request& req, httplib::Response& res) {
         std::vector<uchar> buf;
-        if (!app.overlayJpeg(intParam(req, "cam"), buf)) return sendError(res, "no result yet", 404);
+        uint64_t version=0;
+        if(req.has_param("v"))try{version=std::stoull(req.get_param_value("v"));}catch(...){return sendError(res,"bad overlay version");}
+        if (!app.overlayJpeg(intParam(req, "cam"), buf,version)) {
+            res.set_header("Cache-Control","no-store");res.set_header("Retry-After","1");
+            return sendJson(res,{{"pending",true},{"ver",version}},202);
+        }
         sendJpeg(res, buf);
     });
 

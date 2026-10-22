@@ -40,14 +40,14 @@ static bool applyParams(const json& b, InspectParams& p, std::string& err) {
            num("min_blob_area", 1, 100000, p.minBlobArea);
 }
 
-static bool parseRoi(const json& a, std::vector<cv::Point>& out, std::string& err) {
+static bool parseRoi(const json& a, std::vector<cv::Point>& out, std::string& err,size_t minPoints=3) {
     out.clear();
     if (!a.is_array()) { err = "roi must be an array"; return false; }
     for (auto& pt : a) {
         if (!pt.is_array() || pt.size() != 2 || !pt[0].is_number() || !pt[1].is_number()) { err = "bad roi point"; return false; }
         out.emplace_back(cvRound(pt[0].get<double>()), cvRound(pt[1].get<double>()));
     }
-    if (!out.empty() && out.size() < 3) { err = "roi needs at least 3 points"; out.clear(); return false; }
+    if (!out.empty() && out.size() < minPoints) { err = "not enough polygon/polyline points"; out.clear(); return false; }
     return true;
 }
 
@@ -82,6 +82,27 @@ static bool applySeam(const json& b, const cv::Size& imgSize, SeamParams& s, std
            num("tol_edge", 0.1, 50, s.tolEdge) && num("edge_frac", 0, 0.5, s.edgeFrac);
 }
 
+static json geometryToJson(const GeometryParams& g) {
+    return {{"enabled",g.enabled},{"top_edge",roiToJson(g.topEdge)},{"body_roi",roiToJson(g.bodyRoi)},
+      {"band",g.band},{"position_tolerance",g.positionTolerance},{"angle_tolerance",g.angleTolerance},{"shape_tolerance",g.shapeTolerance}};
+}
+static bool applyGeometry(const json& b,cv::Size size,GeometryParams& g,std::string& err) {
+    if(!b.is_object()){err="geometry must be an object";return false;}
+    if(b.contains("enabled")){if(!b["enabled"].is_boolean()){err="bad geometry enabled";return false;}g.enabled=b["enabled"].get<bool>();}
+    for(const char* key:{"top_edge","body_roi"})if(b.contains(key)) {
+        auto& dst=std::string(key)=="top_edge"?g.topEdge:g.bodyRoi;
+        if(!parseRoi(b[key],dst,err,std::string(key)=="top_edge"?2:3)||dst.size()>64){err="bad geometry polyline";return false;}
+        for(auto pt:dst)if(size.width>0&&(pt.x<0||pt.y<0||pt.x>=size.width||pt.y>=size.height)){err="geometry point outside image";return false;}
+    }
+    auto num=[&](const char* key,double lo,double hi,double& dst){
+        if(!b.contains(key))return true;
+        if(!b[key].is_number()||b[key]<lo||b[key]>hi){err=std::string("bad geometry value for ")+key;return false;}
+        dst=b[key].get<double>();return true;
+    };
+    return num("band",4,40,g.band)&&num("position_tolerance",.1,30,g.positionTolerance)&&
+      num("angle_tolerance",.05,3,g.angleTolerance)&&num("shape_tolerance",.2,10,g.shapeTolerance);
+}
+
 App::App(fs::path sourceDir, fs::path configPath, fs::path logDir)
     : source_(std::move(sourceDir)), cfgPath_(std::move(configPath)), log_(std::move(logDir)) {
     for (int i = 0; i < kCameras; ++i) {
@@ -99,16 +120,28 @@ App::App(fs::path sourceDir, fs::path configPath, fs::path logDir)
     }
     load();
     for (auto& c : cams_) rebuild(*c);
+    artifactWorker_=std::thread(&App::artifactLoop,this);
     worker_ = std::thread(&App::loop, this);
 }
 
 App::~App() {
     quit_ = true;
     if (worker_.joinable()) worker_.join();
+    {std::lock_guard<std::mutex> lock(artifactM_);artifactStop_=true;}
+    artifactCv_.notify_one();
+    if(artifactWorker_.joinable())artifactWorker_.join();
 }
 
 void App::rebuild(Cam& c) {
-    if (!c.ref.empty()) c.insp.setReference(c.ref, c.roi, c.p);
+    if (!c.ref.empty()) {
+        c.insp.setReference(c.ref, c.roi, c.p);
+        c.geo.setReference(c.ref,c.roi,c.geometry,c.seam);
+    }
+    invalidate(c);
+}
+
+void App::invalidate(Cam& c) {
+    std::lock_guard<std::mutex> lock(c.resultM);++c.generation;c.last=json::object();c.overlayResult=json::object();c.overlay.clear();c.overlayVer=0;
 }
 
 void App::load() {
@@ -126,6 +159,7 @@ void App::load() {
         applyParams(cj, c.p, err);
         if (cj.contains("roi")) parseRoi(cj["roi"], c.roi, err);
         if (cj.contains("seam")) applySeam(cj["seam"], cv::Size(), c.seam, err);
+        if(cj.contains("geometry"))applyGeometry(cj["geometry"],cv::Size(),c.geometry,err);
         std::string ref = cj.value("reference", "");
         if (ref == "upload") {
             cv::Mat m = cv::imread(refImagePath(i).string());
@@ -150,6 +184,7 @@ void App::save() {
         cj["reference"] = c->refName;
         cj["roi"] = roiToJson(c->roi);
         cj["seam"] = seamToJson(c->seam);
+        cj["geometry"]=geometryToJson(c->geometry);
         j["cameras"].push_back(cj);
     }
     fs::create_directories(cfgPath_.parent_path());
@@ -169,6 +204,7 @@ json App::state() {
         cj["reference"] = c.refName;
         cj["roi"] = roiToJson(c.roi);
         cj["seam"] = seamToJson(c.seam);
+        cj["geometry"]=geometryToJson(c.geometry);
         cj["width"] = c.ref.cols;
         cj["height"] = c.ref.rows;
         j["cameras_info"].push_back(cj);
@@ -185,10 +221,17 @@ json App::status() {
     j["batch_ms"] = batchMs_.load();
     j["batch_max_frame_ms"] = batchMaxFrameMs_.load();
     j["budget_ms"] = 500;
+    j["batch_decision_ms"]=batchMs_.load();
+    j["artifacts"]={{"completed",artifactCompleted_.load()},{"coalesced",artifactDropped_.load()},
+      {"errors",artifactErrors_.load()},{"last_render_ms",artifactLastMs_.load()}};
+    {std::lock_guard<std::mutex> lock(artifactM_);int pending=0;for(auto& job:pendingArtifacts_)pending+=job.has_value();j["artifacts"]["pending"]=pending;}
+    j["logging"]=log_.status();
     j["last"] = json::array();
     for (int i = 0; i < kCameras; ++i) {
-        std::lock_guard<std::mutex> lk(cams_[i]->m);
-        j["last"].push_back(cams_[i]->last.is_null() ? json::object() : cams_[i]->last);
+        std::lock_guard<std::mutex> lk(cams_[i]->resultM);
+        auto snapshot=cams_[i]->last.is_null()?json::object():cams_[i]->last;
+        snapshot["available_overlay"]=cams_[i]->overlayResult;
+        j["last"].push_back(std::move(snapshot));
     }
     return j;
 }
@@ -209,9 +252,15 @@ bool App::setCamera(int cam, const json& b, std::string& err) {
             }
         SeamParams seam = c.seam;
         if (b.contains("seam") && !applySeam(b["seam"], c.ref.size(), seam, err)) return false;
+        GeometryParams geometry=c.geometry;
+        if(b.contains("geometry")&&!applyGeometry(b["geometry"],c.ref.size(),geometry,err))return false;
+        if(geometry.enabled&&(geometry.topEdge.size()<2||geometry.bodyRoi.size()<3||roi.size()<3||!seam.enabled)) {
+            err="geometry requires label ROI, plastic ROI, top edge and enabled seam";return false;
+        }
         c.p = p;
         c.roi = roi;
         c.seam = seam;
+        c.geometry=geometry;
         rebuild(c);
     }
     save();
@@ -245,7 +294,7 @@ bool App::setReferenceFromFrame(int cam, const std::string& frame, std::string& 
         std::lock_guard<std::mutex> lk(c.m);
         cv::Mat m;
         if (!readFrame(c, frame, m)) { err = "unknown frame"; return false; }
-        if (!c.ref.empty() && m.size() != c.ref.size()) c.roi.clear();
+        if (!c.ref.empty() && m.size() != c.ref.size()) {c.roi.clear();c.geometry.enabled=false;}
         c.ref = m;
         c.refName = frame;
         rebuild(c);
@@ -260,7 +309,7 @@ bool App::setReferenceFromImage(int cam, const cv::Mat& img, std::string& err) {
     Cam& c = *cams_[cam];
     {
         std::lock_guard<std::mutex> lk(c.m);
-        if (!c.ref.empty() && img.size() != c.ref.size()) c.roi.clear();
+        if (!c.ref.empty() && img.size() != c.ref.size()) {c.roi.clear();c.geometry.enabled=false;}
         c.ref = img;
         c.refName = "upload";
         fs::create_directories(cfgPath_.parent_path());
@@ -281,11 +330,12 @@ static void drawDefect(cv::Mat& img, const std::vector<cv::Point>& roi) {
 }
 
 static std::vector<uchar> renderOverlay(const cv::Mat& img, const InspectResult& r, const std::vector<cv::Point>& roi,
-                                        const SeamParams& sp, const SeamResult& sr) {
+                                        const SeamParams& sp, const SeamResult& sr,const GeometryResult& geometry) {
     cv::Mat vis = img.clone();
     if (!r.heatmap.empty()) {
         cv::Mat hm, heat;
         cv::resize(r.heatmap, hm, img.size());
+        cv::warpAffine(hm,hm,cv::Mat(r.refToCurrent),img.size(),cv::INTER_LINEAR,cv::BORDER_CONSTANT,0);
         // normalise to the detection threshold: thr -> mid colour, 2*thr -> red; below thr/2 not shown
         const double thr = std::max(1, r.diffThreshold);
         cv::Mat boosted;
@@ -309,6 +359,8 @@ static std::vector<uchar> renderOverlay(const cv::Mat& img, const InspectResult&
         for (auto& q : sr.centerPts) cv::circle(vis, q, 1, cv::Scalar(0, 255, 0), -1);
         for (auto& q : sr.badPts) cv::circle(vis, q, 2, cv::Scalar(0, 0, 255), -1);
     }
+    for(auto pt:geometry.edgePoints)cv::circle(vis,pt,2,cv::Scalar(0,220,0),-1);
+    for(auto pt:geometry.badPoints)cv::circle(vis,pt,3,cv::Scalar(0,0,255),-1);
     std::vector<uchar> buf;
     cv::imencode(".jpg", vis, buf, {cv::IMWRITE_JPEG_QUALITY, 80});
     return buf;
@@ -316,14 +368,19 @@ static std::vector<uchar> renderOverlay(const cv::Mat& img, const InspectResult&
 
 json App::inspectLocked(Cam& c, int id, const cv::Mat& imgIn, const std::string& name,
                         const std::string& source, bool defect, bool keepOverlay) {
+    auto started=Clock::now();
     cv::Mat img = imgIn;
     if (defect) { img = imgIn.clone(); drawDefect(img, c.roi); }
-    InspectResult r = c.insp.inspect(img, c.p);
+    cv::Mat artifactImage=keepOverlay&&source=="upload"?img.clone():img;
+    GeometryResult geometry=c.geo.inspect(img,c.geometry);
+    InspectResult r = c.insp.inspect(img,c.p,geometry.compensated?&geometry.refToCurrent:nullptr);
     SeamResult sr = measureSeam(img, c.seam);
     // the seam adds its own reject reason; an existing reason of the main inspection stays the primary one
     const bool seamReject = sr.reject && r.reason != "no_reference" && r.reason != "size_mismatch";
-    const bool reject = r.reject || seamReject;
-    const std::string reason = r.reason.empty() && seamReject ? "seam_deviation" : r.reason;
+    const bool valid=r.reason!="no_reference"&&r.reason!="size_mismatch";
+    const bool geometryReject=geometry.reject&&valid;
+    const bool reject = r.reject || seamReject || geometryReject;
+    const std::string reason = geometryReject?geometry.reason:(r.reason.empty() && seamReject ? "seam_deviation" : r.reason);
 
     json j;
     j["cam"] = id;
@@ -334,6 +391,14 @@ json App::inspectLocked(Cam& c, int id, const cv::Mat& imgIn, const std::string&
     j["reject"] = reject;
     j["verdict"] = reject ? "REJECT" : (r.reason == "no_reference" || r.reason == "size_mismatch" ? "NO_REFERENCE" : "OK");
     j["reason"] = reason;
+    j["reasons"]=json::array();
+    if(!r.reason.empty())j["reasons"].push_back(r.reason);
+    if(geometryReject)j["reasons"].push_back(geometry.reason);
+    if(seamReject)j["reasons"].push_back("seam_deviation");
+    if(geometry.enabled)j["geometry"]={{"found",geometry.found},{"reject",geometry.reject},{"reason",geometry.reason},
+      {"label_shift",{geometry.labelShift.x,geometry.labelShift.y}},{"angle",geometry.angle},{"coverage",geometry.coverage},
+      {"max_residual",geometry.maxResidual},{"body_shift",{geometry.bodyShift.x,geometry.bodyShift.y}},
+      {"body_angle",geometry.bodyAngle},{"compensated",geometry.compensated},{"ms",geometry.ms}};
     if (c.seam.enabled)
         j["seam"] = {{"found", sr.found}, {"reject", sr.reject}, {"ratio", std::round(sr.ratio * 100) / 100},
                      {"max_dev", std::round(sr.maxDev * 100) / 100}, {"worst_t", std::round(sr.worstT * 1000) / 1000},
@@ -343,28 +408,86 @@ json App::inspectLocked(Cam& c, int id, const cv::Mat& imgIn, const std::string&
     j["shift"] = {std::round(r.shift.x * 100) / 100, std::round(r.shift.y * 100) / 100};
     j["zones"] = json::array();
     for (auto& z : r.zones) j["zones"].push_back({z.x, z.y, z.width, z.height});
-    j["ms"] = std::round((r.ms + sr.ms) * 100) / 100;
+    j["ms"] = std::round((r.ms + sr.ms + geometry.ms) * 100) / 100;
+    j["decision_ms"]=std::chrono::duration<double,std::milli>(Clock::now()-started).count();
     j["ts"] = nowMs();
 
-    if (keepOverlay) {
-        c.overlay = renderOverlay(img, r, c.roi, c.seam, sr);
-        j["ver"] = ++c.ver;
-    }
-    c.last = j;
-
-    // reject artifacts: always for manual runs, throttled for the emulated stream
-    json rec = j;
-    if (reject && keepOverlay) {
-        int64_t t = nowMs();
-        if (source != "emulation" || t - c.lastRejectSaveMs > 5000) {
-            c.lastRejectSaveMs = t;
-            fs::path p = log_.rejectsDir() / ("cam" + std::to_string(id) + "_" + std::to_string(t) + "_" + name + ".jpg");
-            std::ofstream(p, std::ios::binary).write(reinterpret_cast<const char*>(c.overlay.data()), c.overlay.size());
-            rec["overlay"] = p.filename().string();
+    j["ver"]=++c.ver;j["overlay_ready"]=false;j["artifact_state"]=keepOverlay?"pending":"disabled";
+    {std::lock_guard<std::mutex> lock(c.resultM);c.last=j;}
+    if(keepOverlay) {
+        ArtifactJob job;job.camera=id;job.version=c.ver;job.generation=c.generation;
+        // Mat ownership is shared and immutable; uploads are cloned because their caller may reuse the buffer.
+        job.image=std::move(artifactImage);job.inspection=std::move(r);job.roi=c.roi;
+        job.seam=c.seam;job.seamResult=std::move(sr);job.geometry=std::move(geometry);job.record=j;job.queued=Clock::now();
+        if(reject&&(source!="emulation"||j["ts"].get<int64_t>()-c.lastRejectSaveMs>5000)) {
+            job.saveReject=true;c.lastRejectSaveMs=j["ts"].get<int64_t>();
         }
-    }
-    log_.append(rec);
+        enqueueArtifact(std::move(job));
+    } else log_.append(j);
     return j;
+}
+
+void App::enqueueArtifact(ArtifactJob job) {
+    std::optional<ArtifactJob> previous;
+    {
+        std::lock_guard<std::mutex> lock(artifactM_);auto& slot=pendingArtifacts_[job.camera];
+        previous=std::move(slot);slot=std::move(job);
+    }
+    if(previous) {
+        previous->record["artifact_state"]="coalesced";log_.append(previous->record);++artifactDropped_;
+    }
+    artifactCv_.notify_one();
+}
+
+void App::artifactLoop() {
+    int next=0;
+    for(;;) {
+        std::optional<ArtifactJob> work;
+        {
+            std::unique_lock<std::mutex> lock(artifactM_);
+            artifactCv_.wait(lock,[&]{if(artifactStop_)return true;for(auto& p:pendingArtifacts_)if(p)return true;return false;});
+            for(int k=0;k<kCameras;++k) {
+                int camera=(next+k)%kCameras;
+                if(pendingArtifacts_[camera]) {work=std::move(pendingArtifacts_[camera]);pendingArtifacts_[camera].reset();next=(camera+1)%kCameras;break;}
+            }
+            if(!work&&artifactStop_)return;
+        }
+        if(!work)continue;
+        auto& job=*work;auto started=Clock::now();
+        try {
+            auto bytes=renderOverlay(job.image,job.inspection,job.roi,job.seam,job.seamResult,job.geometry);
+            if(job.saveReject) {
+                auto filename="cam"+std::to_string(job.camera)+"_"+std::to_string(job.record["ts"].get<int64_t>())+"_v"+std::to_string(job.version)+".jpg";
+                std::ofstream file(log_.rejectsDir()/filename,std::ios::binary);file.write(reinterpret_cast<const char*>(bytes.data()),bytes.size());
+                if(!file)throw std::runtime_error("cannot save reject image");
+                job.record["overlay"]=filename;
+            }
+            double ms=std::chrono::duration<double,std::milli>(Clock::now()-started).count();
+            double latency=std::chrono::duration<double,std::milli>(Clock::now()-job.queued).count();
+            job.record["artifact_state"]="ready";job.record["artifact_ms"]=ms;job.record["visualization_latency_ms"]=latency;
+            job.record["overlay_ready"]=true;job.record["overlay_ver"]=job.version;
+            auto& c=*cams_[job.camera];
+            {
+                std::lock_guard<std::mutex> lock(c.resultM);
+                if(c.generation==job.generation && job.version>c.overlayVer) {
+                    c.overlay=std::move(bytes);c.overlayVer=job.version;
+                    c.overlayResult={{"ver",job.version},{"frame",job.record["frame"]},{"verdict",job.record["verdict"]},{"ts",job.record["ts"]}};
+                    if(c.last.value("ver",uint64_t(0))==job.version) {
+                        c.last["overlay_ready"]=true;c.last["overlay_ver"]=job.version;c.last["artifact_state"]="ready";
+                        c.last["artifact_ms"]=ms;c.last["visualization_latency_ms"]=latency;
+                    }
+                }
+            }
+            artifactLastMs_=ms;++artifactCompleted_;
+        } catch(const std::exception& e) {
+            ++artifactErrors_;job.record["artifact_state"]="error";job.record["artifact_error"]=e.what();
+            auto& c=*cams_[job.camera];std::lock_guard<std::mutex> lock(c.resultM);
+            if(c.generation==job.generation&&c.last.value("ver",uint64_t(0))==job.version) {
+                c.last["artifact_state"]="error";c.last["artifact_error"]=e.what();
+            }
+        }
+        log_.append(job.record);
+    }
 }
 
 json App::inspectFrame(int cam, const std::string& frame, bool defect, std::string& err) {
@@ -422,9 +545,10 @@ bool App::frameJpeg(int cam, const std::string& frame, std::vector<uchar>& out) 
     return !out.empty();
 }
 
-bool App::overlayJpeg(int cam, std::vector<uchar>& out) {
+bool App::overlayJpeg(int cam, std::vector<uchar>& out,uint64_t version) {
     if (!validCam(cam)) return false;
-    std::lock_guard<std::mutex> lk(cams_[cam]->m);
+    std::lock_guard<std::mutex> lk(cams_[cam]->resultM);
+    if(version&&version!=cams_[cam]->overlayVer)return false;
     out = cams_[cam]->overlay;
     return !out.empty();
 }

@@ -7,3 +7,4 @@ server.log
 build_configure.log
 frames36
 .tools/
+artifacts/

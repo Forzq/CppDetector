@@ -13,6 +13,10 @@ const S = {
   seam: null,          // working copy of the seam settings of the current camera
   seamPick: 0,         // 0 = off, 1/2 = waiting for the first/second seam end click
   seamDrag: -1,
+  geometry: null,
+  geometryPick: null,
+  geometryDrag: null,
+  lastResultImageVer: null,
 };
 
 /* ---------- helpers ---------- */
@@ -73,6 +77,11 @@ function reasonText(r) {
       return `Кадр сдвинут относительно эталона на (${fmt(r.shift && r.shift[0])}, ${fmt(r.shift && r.shift[1])}) px — больше допустимого. Увеличь допуск на сдвиг или проверь камеру.`;
     case "seam_deviation":
       return seamText(r.seam);
+    case "label_position": return "Этикетка смещена относительно пластикового корпуса больше допуска.";
+    case "label_tilt": return "Наклон этикетки относительно корпуса превышает допуск.";
+    case "label_edge_deviation": return "Обнаружен локальный изгиб края этикетки или стыка.";
+    case "geometry_unavailable": return "Не удалось уверенно измерить край этикетки и стык. Проверь линии, полосу поиска и наличие этикетки.";
+    case "body_unavailable": return "Не удалось определить положение корпуса. Выбери устойчивый контур, который движется вместе с ведром независимо от печати.";
     case "size_mismatch":
       return "Размер кадра не совпадает с размером эталона этой камеры — сравнение невозможно.";
     case "no_reference":
@@ -130,10 +139,15 @@ function updateTiles(status) {
     tile.querySelector(".meta .muted").textContent =
       `${r.frame} · score ${fmt(r.score, 2)}% / порог ${fmt(r.threshold, 1)}% · ${fmt(r.ms, 0)} мс` +
       (r.reject && r.reason !== "score_over_threshold" ? " · " + r.reason : "");
-    if (r.ver && S.lastVer[i] !== r.ver) {
-      S.lastVer[i] = r.ver;
-      tile.querySelector("img").src = `/api/overlay?cam=${i}&v=${r.ver}`;
+    const picture=r.available_overlay||{};
+    if (picture.ver && S.lastVer[i] !== picture.ver) {
+      S.lastVer[i] = picture.ver;
+      tile.querySelector("img").src = `/api/overlay?cam=${i}&v=${picture.ver}`;
     }
+    tile.querySelector("img").style.visibility=picture.ver?"visible":"hidden";
+    tile.querySelector("img").title=picture.ver?`Изображение: ${picture.frame}, ${picture.verdict}, версия ${picture.ver}`:"Изображение готовится";
+    if(picture.ver&&picture.ver!==r.ver)tile.querySelector(".meta .muted").textContent+=` · изображение: ${picture.frame} (${picture.verdict})`;
+    else if(!picture.ver)tile.querySelector(".meta .muted").textContent+=" · изображение готовится";
   });
 }
 
@@ -155,10 +169,19 @@ async function poll() {
     bar.classList.toggle("over", s.batch_ms > s.budget_ms);
     updateTiles(s);
     updateCamPickerMarks(s);
-    if (s.running && $("tab-cam").classList.contains("active") && S.mode === "result") {
+    if ($("tab-cam").classList.contains("active") && S.mode === "result") {
       const r = s.last[S.cam];
-      if (r && r.ver && S.lastResultVer !== r.ver) { S.lastResultVer = r.ver; renderResult(r); loadResultImage(r.ver); }
+      if (r && r.ver) {
+        if (S.lastResultVer !== r.ver || S.resultArtifactState !== r.artifact_state) {
+          if(S.lastResultVer!==r.ver){S.img.result=null;S.lastResultImageVer=null;}
+          S.lastResultVer=r.ver;S.resultArtifactState=r.artifact_state;renderResult(r);
+        }
+        if(r.overlay_ready && r.overlay_ver===r.ver && S.lastResultImageVer!==r.ver)loadResultImage(r.ver);
+      }
     }
+    const problems=(s.logging?.dropped||0)+(s.logging?.write_errors||0)+(s.artifacts?.errors||0);
+    $("backgroundInfo").textContent=problems?`Ошибки сохранения: ${problems}`:
+      `Изображения в фоне: ${s.artifacts?.pending||0} · заменено более новыми: ${s.artifacts?.coalesced||0}`;
   } catch (e) { /* toast already shown */ }
   setTimeout(poll, 500);
 }
@@ -203,6 +226,7 @@ const PARAMS = [
 function selectCam(i) {
   S.cam = i;
   S.lastResultVer = null;
+  S.lastResultImageVer=null;S.img.result=null;
   document.querySelectorAll("#camPicker button").forEach((b, k) => b.classList.toggle("active", k === i));
   const c = cur();
   fillSelect($("refSelect"), c.frames, c.reference);
@@ -213,6 +237,7 @@ function selectCam(i) {
   S.seam = JSON.parse(JSON.stringify(c.seam));
   S.seamPick = 0;
   fillSeamUi();
+  S.geometry=JSON.parse(JSON.stringify(c.geometry));S.geometryPick=null;S.geometryDrag=null;fillGeometryUi();
   $("result").replaceChildren();
   $("allResults").replaceChildren();
   setMode("ref");
@@ -234,9 +259,10 @@ function loadFrameImage() {
 }
 
 function loadResultImage(ver) {
+  const camera=S.cam;
   const img = new Image();
-  img.onload = () => { S.img.result = img; if (S.mode === "result") draw(); };
-  img.src = `/api/overlay?cam=${S.cam}&v=${ver || Date.now()}`;
+  img.onload = () => { if(S.cam!==camera||S.lastResultVer!==ver)return;S.lastResultImageVer=ver;S.img.result = img; if (S.mode === "result") draw(); };
+  img.src = `/api/overlay?cam=${camera}&v=${ver}`;
 }
 
 function setMode(m) {
@@ -262,7 +288,13 @@ function draw() {
     canvas.height = base.naturalHeight;
   }
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.drawImage(img || base, 0, 0, canvas.width, canvas.height);
+  if(S.mode==="result"&&!img) {
+    ctx.fillStyle="#19202b";ctx.fillRect(0,0,canvas.width,canvas.height);ctx.fillStyle="#fff";
+    ctx.font=`${Math.round(canvas.width/48)}px sans-serif`;
+    const pendingText=S.resultArtifactState==="error"?"Вердикт готов. Ошибка подготовки изображения.":
+      S.resultArtifactState==="disabled"?"Пакетная проверка выполнена без отрисовки.":"Вердикт готов. Изображение готовится в фоне…";
+    ctx.fillText(pendingText,canvas.width*.06,canvas.height*.5);
+  } else ctx.drawImage(img || base, 0, 0, canvas.width, canvas.height);
   $("viewInfo").textContent =
     S.mode === "ref" ? "эталон" : S.mode === "frame" ? $("testSelect").value : "тепловая карта и зоны аномалий";
   const k = canvas.width / 900;
@@ -287,6 +319,7 @@ function draw() {
     });
   }
   drawSeam(k);
+  drawGeometry(k);
   $("roiInfo").textContent = S.roi.length
     ? `точек: ${S.roi.length}` + (S.roi.length < 3 ? " (нужно минимум 3)" : "")
     : "ROI не задан — проверяется весь кадр";
@@ -341,6 +374,13 @@ function segDist(p, a, b) {
 canvas.addEventListener("pointerdown", (ev) => {
   if (ev.button !== 0) return;
   const pt = canvasPoint(ev);
+  if(S.geometryPick) {
+    S.geometry[S.geometryPick].push(pt);fillGeometryUi();draw();return;
+  }
+  if(S.geometry)for(const key of ["top_edge","body_roi"]) {
+    const index=S.geometry[key].findIndex(p=>Math.hypot(p[0]-pt[0],p[1]-pt[1])<=hitRadius());
+    if(index>=0){S.geometryDrag={key,index};canvas.setPointerCapture(ev.pointerId);draw();return;}
+  }
   if (S.seamPick) {                                   // placing the seam line ends
     if (S.seamPick === 1) { S.seam.p0 = pt; S.seam.p1 = pt; S.seamPick = 2; }
     else { S.seam.p1 = pt; S.seamPick = 0; saveSeam(); }
@@ -371,6 +411,7 @@ canvas.addEventListener("pointerdown", (ev) => {
 });
 
 canvas.addEventListener("pointermove", (ev) => {
+  if(S.geometryDrag){S.geometry[S.geometryDrag.key][S.geometryDrag.index]=canvasPoint(ev);draw();return;}
   if (S.seamDrag >= 0) { S.seam[S.seamDrag ? "p1" : "p0"] = canvasPoint(ev); draw(); return; }
   if (S.seamPick === 2) { S.seam.p1 = canvasPoint(ev); draw(); return; }
   if (S.drag < 0) return;
@@ -379,6 +420,7 @@ canvas.addEventListener("pointermove", (ev) => {
 });
 
 canvas.addEventListener("pointerup", () => {
+  if(S.geometryDrag){S.geometryDrag=null;draw();saveGeometry();return;}
   if (S.seamDrag >= 0) { S.seamDrag = -1; draw(); saveSeam(); return; }
   if (S.drag < 0) return;
   S.drag = -1;
@@ -388,6 +430,7 @@ canvas.addEventListener("pointerup", () => {
 
 canvas.addEventListener("contextmenu", (ev) => {
   ev.preventDefault();
+  if(S.geometryPick){finishGeometryPick();return;}
   const i = hitPoint(canvasPoint(ev));
   if (i >= 0) { S.roi.splice(i, 1); draw(); saveRoi(); }
 });
@@ -416,6 +459,57 @@ async function saveRoi() {
 
 /* ----- seam (label seam straightness) ----- */
 
+const GEOMETRY_PARAMS=[["band",0],["position_tolerance",1],["angle_tolerance",2],["shape_tolerance",1]];
+function fillGeometryUi() {
+  const g=S.geometry;if(!g)return;
+  $("geometryEnabled").checked=g.enabled;
+  GEOMETRY_PARAMS.forEach(([key,d])=>{$("geometry_"+key).value=g[key];$("v_geometry_"+key).textContent=fmt(g[key],d);});
+  $("geometryInfo").textContent=S.geometryPick?
+    `Добавляй точки ${S.geometryPick==="top_edge"?"вдоль края этикетки":"вокруг опорного контура корпуса"}. Затем «Завершить точки» или правая кнопка мыши.`:
+    `Край: ${g.top_edge.length} точек · корпус: ${g.body_roi.length} точек. Точки можно перетаскивать.`;
+}
+function drawGeometry(k) {
+  if(!S.geometry)return;
+  for(const [key,color,closed] of [["top_edge","#ff66dd",false],["body_roi","#66bbff",true]]) {
+    const points=S.geometry[key];if(!points.length)continue;
+    ctx.save();ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=2*k;ctx.beginPath();
+    points.forEach((p,i)=>i?ctx.lineTo(...p):ctx.moveTo(...p));if(closed&&points.length>=3)ctx.closePath();ctx.stroke();
+    points.forEach(p=>{ctx.beginPath();ctx.arc(p[0],p[1],4*k,0,Math.PI*2);ctx.fill();});ctx.restore();
+  }
+}
+async function saveGeometry() {
+  try{await post("/api/camera?cam="+S.cam,{geometry:S.geometry});cur().geometry=JSON.parse(JSON.stringify(S.geometry));flashSaved();}
+  catch(e){S.geometry=JSON.parse(JSON.stringify(cur().geometry));fillGeometryUi();draw();}
+}
+function startGeometryPick(key) {
+  S.geometry=JSON.parse(JSON.stringify(cur().geometry));S.geometryBackup=JSON.parse(JSON.stringify(S.geometry));
+  S.geometryPick=key;S.geometry[key]=[];S.seamPick=0;setMode("ref");fillGeometryUi();draw();
+}
+function finishGeometryPick() {
+  if(!S.geometryPick)return;
+  const min=S.geometryPick==="top_edge"?2:3;
+  if(S.geometry[S.geometryPick].length<min){toast(`Нужно минимум ${min} точки`,true);return;}
+  S.geometryPick=null;fillGeometryUi();draw();saveGeometry();
+}
+$("geometryTop").addEventListener("click",()=>startGeometryPick("top_edge"));
+$("geometryBody").addEventListener("click",()=>startGeometryPick("body_roi"));
+$("geometryFinish").addEventListener("click",finishGeometryPick);
+$("geometryCancel").addEventListener("click",()=>{
+  S.geometryPick=null;S.geometry=JSON.parse(JSON.stringify(cur().geometry));fillGeometryUi();draw();
+});
+$("geometryEnabled").addEventListener("change",()=>{
+  const enabled=$("geometryEnabled").checked;
+  if(enabled&&(S.geometry.top_edge.length<2||S.geometry.body_roi.length<3||S.roi.length<3||!S.seam.enabled)){
+    $("geometryEnabled").checked=false;toast("Сначала задай ROI этикетки, верхний край, область пластика и включи стык",true);return;
+  }
+  S.geometry.enabled=enabled;saveGeometry();
+});
+let geometryTimer;
+GEOMETRY_PARAMS.forEach(([key,d])=>$("geometry_"+key).addEventListener("input",()=>{
+  S.geometry[key]=Number($("geometry_"+key).value);$("v_geometry_"+key).textContent=fmt(S.geometry[key],d);
+  clearTimeout(geometryTimer);geometryTimer=setTimeout(saveGeometry,300);
+}));
+
 const SEAM_PARAMS = [["band", 0], ["tol_mid", 1], ["tol_edge", 1], ["edge_frac", 2]];
 
 function fillSeamUi() {
@@ -441,6 +535,7 @@ async function saveSeam() {
 $("seamPick").addEventListener("click", () => { S.seamPick = 1; fillSeamUi(); });
 $("seamEnabled").addEventListener("change", () => {
   const sm = S.seam;
+  if(!$("seamEnabled").checked&&S.geometry?.enabled){$("seamEnabled").checked=true;toast("Сначала отключи контроль положения этикетки",true);return;}
   if ($("seamEnabled").checked && sm.p0[0] === sm.p1[0] && sm.p0[1] === sm.p1[1]) {
     $("seamEnabled").checked = false;
     toast("Сначала задай линию стыка на кадре", true);
@@ -533,7 +628,13 @@ function renderResult(r) {
   add("Чувствительность", fmt(r.sensitivity, 2));
   add("Сдвиг, px", r.shift ? `${fmt(r.shift[0])}, ${fmt(r.shift[1])}` : "—");
   if (r.seam) add("Стык", !r.seam.found ? "не найден" : `${fmt(r.seam.max_dev, 2)} px на ${Math.round(r.seam.worst_t * 100)}% (${fmt(r.seam.ratio, 2)}× допуска)`);
-  add("Время", fmt(r.ms, 1) + " мс");
+  if(r.geometry) {
+    add("Геометрия",r.geometry.found?`смещение ${r.geometry.label_shift.map(x=>fmt(x,2)).join(", ")} px · наклон ${fmt(r.geometry.angle,2)}°`:reasonText({reason:r.geometry.reason}));
+    add("Измерение геометрии",fmt(r.geometry.ms,2)+" мс");
+  }
+  add("До вердикта", fmt(r.decision_ms??r.ms, 1) + " мс");
+  add("Изображение",r.overlay_ready?`готово · фон ${fmt(r.artifact_ms,1)} мс · ожидание ${fmt(r.visualization_latency_ms,1)} мс`:
+    r.artifact_state==="error"?"ошибка подготовки":r.artifact_state==="disabled"?"без отрисовки":"готовится в фоне");
   box.append(kv);
   const zones = r.zones || [];
   if (zones.length) {
@@ -541,14 +642,16 @@ function renderResult(r) {
     z.style.marginTop = "6px";
     box.append(z);
   }
-  const why = r.reject ? reasonText(r) : r.verdict === "NO_REFERENCE" ? reasonText(r) : `Score ${fmt(r.score, 3)}% не превышает порог ${fmt(r.threshold, 2)}% — норма.`;
+  const why = r.reject ? (r.reasons?.length?[...new Set(r.reasons)].map(reason=>reasonText({...r,reason})).join(" "):reasonText(r)) :
+    r.verdict === "NO_REFERENCE" ? reasonText(r) : `Score ${fmt(r.score, 3)}% не превышает порог ${fmt(r.threshold, 2)}% — норма.`;
   box.append(el("div", "reasonbox " + (r.reject ? "bad" : r.verdict === "OK" ? "ok" : "warn"), why));
 }
 
 function afterInspect(r) {
   S.lastResultVer = r.ver;
+  S.resultArtifactState=r.artifact_state;S.img.result=null;S.lastResultImageVer=null;
   renderResult(r);
-  loadResultImage(r.ver);
+  if(r.overlay_ready)loadResultImage(r.ver);
   setMode("result");
   refreshLogIfVisible();
 }

@@ -2,12 +2,16 @@
 #include "decision_log.h"
 #include "../inspect/inspector.h"
 #include "../inspect/seam.h"
+#include "../inspect/geometry.h"
 #include <atomic>
 #include <filesystem>
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <thread>
+#include <condition_variable>
+#include <optional>
+#include <chrono>
 
 namespace cd {
 
@@ -38,12 +42,13 @@ public:
     void setRunning(bool on) { running_ = on; }
 
     bool frameJpeg(int cam, const std::string& frame, std::vector<uchar>& out);   // frame="" -> reference
-    bool overlayJpeg(int cam, std::vector<uchar>& out);
+    bool overlayJpeg(int cam, std::vector<uchar>& out, uint64_t version = 0);
     DecisionLog& log() { return log_; }
 
 private:
     struct Cam {
         std::mutex m;
+        std::mutex resultM;           // display never waits for inspection or disk IO
         fs::path dir;
         std::vector<std::string> frames;
         std::string refName;          // frame folder name or "upload"
@@ -51,12 +56,29 @@ private:
         std::vector<cv::Point> roi;
         InspectParams p;
         SeamParams seam;              // seam straightness check (KB D18)
+        GeometryParams geometry;
+        LabelGeometry geo;
         Inspector insp;
         json last;
+        json overlayResult;
         std::vector<uchar> overlay;
         uint64_t ver = 0;
+        uint64_t generation = 0, overlayVer = 0;
         size_t cursor = 0;
         int64_t lastRejectSaveMs = 0;
+    };
+    struct ArtifactJob {
+        int camera = 0;
+        uint64_t version = 0, generation = 0;
+        cv::Mat image;
+        InspectResult inspection;
+        std::vector<cv::Point> roi;
+        SeamParams seam;
+        SeamResult seamResult;
+        GeometryResult geometry;
+        json record;
+        bool saveReject = false;
+        std::chrono::steady_clock::time_point queued;
     };
 
     fs::path refImagePath(int cam) const { return cfgPath_.parent_path() / ("ref_" + cfgPath_.stem().string() + "_cam" + std::to_string(cam) + ".png"); }
@@ -69,6 +91,9 @@ private:
     void load();
     void tick();
     void loop();
+    void artifactLoop();
+    void enqueueArtifact(ArtifactJob job);
+    void invalidate(Cam& c);
 
     fs::path source_, cfgPath_;
     DecisionLog log_;
@@ -81,6 +106,13 @@ private:
     std::atomic<uint64_t> batch_{0};
     std::atomic<double> batchMs_{0}, batchMaxFrameMs_{0};
     std::thread worker_;
+    std::thread artifactWorker_;
+    std::mutex artifactM_;
+    std::condition_variable artifactCv_;
+    std::optional<ArtifactJob> pendingArtifacts_[kCameras]; // bounded: latest pending image per camera
+    bool artifactStop_ = false;
+    std::atomic<uint64_t> artifactDropped_{0}, artifactCompleted_{0}, artifactErrors_{0};
+    std::atomic<double> artifactLastMs_{0};
 };
 
 }
